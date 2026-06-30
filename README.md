@@ -5,7 +5,7 @@ The following is a python based pipeline used to analyze the FACES task collecte
 ## Before Analysis (structuring data, file naming, installing depedencies)
 1. Download and install [fMRIPrep](https://github.com/nipreps/fmriprep) (I recommend using their [docker container](https://fmriprep.org/en/20.2.0/docker.html))
 2. Download data from your PACS system (i.e. Flywheel) or public online repository
-3. Run dcm2bids (or dcm2niix and then manually convert to BIDS format)
+3. Convert dicoms into BIDs formatted niftis using `convert_all.sh` > `add_fieldmaps.py` > `merge_into_nesta_bids.sh` (see `CONVERSION_GUIDE.md` for detailed instructions)
 4. Run `moveBadScans.py` in order to exclude any incomplete scans and rename completed scans
 5. If BIDS structure is faulty in any way run `create_bids_json.py` and/or `generateDatasetDescriptions.py`
 6. Make timing files by runnning `makeTimingFiles.py` and/or `makeSingleTimingFile.py` depending on the type of analysis you which to run (see python script headers for more details)
