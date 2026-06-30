@@ -44,6 +44,28 @@ SMOOTHING_SIZE = 6.0
 # HRF model
 HRF_MODEL = "spm"
 
+# ------------------------------------------------------------
+# dACC longitudinal (TMS treatment) analysis config
+# ------------------------------------------------------------
+# Brainnetome Atlas 246 (2mm — matches the res-2 functional grid)
+BN_ATLAS_PATH = "/Users/braveDP/Desktop/BN_Atlas_246_2mm.nii.gz"
+BN_ATLAS_LUT  = "/Users/braveDP/Desktop/BN_Atlas_246_LUT.txt"
+
+# dACC = caudodorsal area 24 + dorsal (pregenual) area 32
+DACC_REGION_NAMES = ["A24cd", "A32p"]
+
+# Contrast used for the dACC fear-response analysis
+DACC_CONTRAST = "Fear_gt_Neutral"
+
+# Study visit (session) order/labels — TMS treatment course
+TIMEPOINT_ORDER = ["T1", "T2", "T3", "T4"]
+TIMEPOINT_LABELS = {
+    "T1": "T1\nBaseline\n(pre-TMS)",
+    "T2": "T2\n(mid-TMS)",
+    "T3": "T3\n(mid-TMS)",
+    "T4": "T4\nPost-TMS\n(end of course)",
+}
+
 # ============================================================
 #  IMPORTS
 # ============================================================
@@ -56,7 +78,9 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 from pathlib import Path
+from scipy import stats as sstats
 
 from nilearn.glm.first_level         import FirstLevelModel, make_first_level_design_matrix
 from nilearn.glm.second_level        import SecondLevelModel
@@ -367,6 +391,355 @@ def write_html_report(subjects: list[str], all_z_maps: dict[str, list[str]],
 
 
 # ============================================================
+#  dACC LONGITUDINAL FEAR-RESPONSE ANALYSIS (TMS TREATMENT COURSE)
+# ============================================================
+"""
+Builds left / right / bilateral dACC ROI masks from the Brainnetome Atlas 246
+(A24cd + A32p, per hemisphere), extracts each subject's mean Fear>Neutral
+z-value within those ROIs at every available study visit (ses-T1..T4), and
+produces:
+  • Three "spaghetti" plots (one per ROI: L, R, bilateral) — one line per
+    subject across the timepoints they have data for, with the group
+    mean +/- SEM overlaid.
+  • A single CSV summarizing group-level descriptives and paired
+    timepoint-to-timepoint statistics for each ROI, to help answer
+    "is the treatment working?"
+"""
+
+def parse_bn_lut(lut_path: str) -> dict[str, int]:
+    """Parse the Brainnetome LUT into {region_name: label_id}."""
+    labels = {}
+    with open(lut_path, "r") as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            try:
+                idx = int(parts[0])
+            except ValueError:
+                continue
+            name = parts[1]
+            labels[name] = idx
+    return labels
+
+
+def get_dacc_label_ids(lut: dict[str, int], hemi: str) -> list[int]:
+    """
+    hemi: 'L', 'R', or 'bilateral'.
+    Returns the Brainnetome label IDs making up the dACC ROI
+    (A24cd + A32p) for the requested hemisphere(s).
+    """
+    suffixes = []
+    if hemi in ("L", "bilateral"):
+        suffixes.append("_L")
+    if hemi in ("R", "bilateral"):
+        suffixes.append("_R")
+
+    ids = []
+    missing = []
+    for region in DACC_REGION_NAMES:
+        for suf in suffixes:
+            name = f"{region}{suf}"
+            if name in lut:
+                ids.append(lut[name])
+            else:
+                missing.append(name)
+    if missing:
+        print(f"  [WARN] dACC label(s) not found in LUT: {missing}")
+    return ids
+
+
+def build_dacc_masks(atlas_path: str, lut_path: str, target_img) -> dict[str, "image.Nifti1Image"]:
+    """
+    Resample the Brainnetome atlas onto the grid of `target_img` (a
+    first-level z-map, since all subjects/sessions share the same
+    MNI152NLin2009cAsym res-2 grid) and build binary dACC masks for
+    left, right, and bilateral.
+    """
+    lut = parse_bn_lut(lut_path)
+    atlas_img = image.load_img(atlas_path)
+    atlas_resampled = image.resample_to_img(atlas_img, target_img, interpolation="nearest")
+    atlas_data = atlas_resampled.get_fdata()
+
+    masks = {}
+    for hemi in ("L", "R", "bilateral"):
+        label_ids = get_dacc_label_ids(lut, hemi)
+        if not label_ids:
+            print(f"  [WARN] No dACC labels resolved for hemi='{hemi}' — skipping mask.")
+            continue
+        mask_data = np.isin(atlas_data, label_ids).astype(np.uint8)
+        n_vox = int(mask_data.sum())
+        print(f"  dACC[{hemi}] ROI: labels={label_ids}  n_voxels={n_vox}")
+        masks[hemi] = image.new_img_like(atlas_resampled, mask_data)
+    return masks
+
+
+def extract_roi_mean(zmap_path: str, mask_img) -> float | None:
+    """Mean z-value within a binary ROI mask for one subject/session z-map."""
+    z_img = image.load_img(zmap_path)
+    mask_data = mask_img.get_fdata().astype(bool)
+    if mask_data.sum() == 0:
+        return None
+    z_data = z_img.get_fdata()
+    if z_data.shape != mask_data.shape:
+        z_img = image.resample_to_img(z_img, mask_img, interpolation="continuous")
+        z_data = z_img.get_fdata()
+    return float(np.nanmean(z_data[mask_data]))
+
+
+def collect_dacc_values(dacc_records: list[dict], masks: dict[str, "image.Nifti1Image"]) -> pd.DataFrame:
+    """
+    dacc_records: list of {subject, timepoint, zmap_path} for the
+    DACC_CONTRAST (one entry per subject/session that has this contrast).
+    Returns a tidy long-format DataFrame:
+        subject | timepoint | hemi | mean_z
+    """
+    rows = []
+    for rec in dacc_records:
+        for hemi, mask_img in masks.items():
+            val = extract_roi_mean(rec["zmap_path"], mask_img)
+            if val is not None:
+                rows.append(dict(subject=rec["subject"], timepoint=rec["timepoint"],
+                                 hemi=hemi, mean_z=val))
+    return pd.DataFrame(rows)
+
+
+# ---- publication-style plotting ----------------------------
+
+_HEMI_TITLES = {
+    "L": "Left dACC",
+    "R": "Right dACC",
+    "bilateral": "Bilateral dACC",
+}
+
+
+def _style_axes(ax):
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_linewidth(1.2)
+    ax.spines["bottom"].set_linewidth(1.2)
+    ax.tick_params(width=1.2)
+
+
+def make_dacc_spaghetti_plot(df_long: pd.DataFrame, hemi: str, out_path: Path):
+    """
+    One polished spaghetti plot for a single ROI (hemi in 'L'/'R'/'bilateral'):
+    a thin line per subject across whichever timepoints they have, with the
+    group mean +/- SEM overlaid as a bold trend line.
+    """
+    sub = df_long[df_long["hemi"] == hemi]
+    if sub.empty:
+        print(f"  [WARN] No data for dACC[{hemi}] — skipping plot.")
+        return
+
+    wide = sub.pivot_table(index="subject", columns="timepoint", values="mean_z")
+    wide = wide.reindex(columns=TIMEPOINT_ORDER)
+    x = np.arange(len(TIMEPOINT_ORDER))
+
+    plt.rcParams.update({
+        "font.family": "sans-serif",
+        "font.size": 11,
+        "axes.titleweight": "bold",
+    })
+    fig, ax = plt.subplots(figsize=(7.5, 5.5), dpi=300)
+
+    n_subj = wide.shape[0]
+    cmap = plt.get_cmap("viridis")
+    colors = [cmap(i / max(n_subj - 1, 1)) for i in range(n_subj)]
+
+    for color, (subj, row) in zip(colors, wide.iterrows()):
+        y = row.values.astype(float)
+        ax.plot(x, y, marker="o", markersize=4, linewidth=1.1,
+                color=color, alpha=0.55, zorder=2)
+
+    # group mean +/- SEM
+    means = wide.mean(axis=0, skipna=True).values
+    sems  = wide.sem(axis=0, skipna=True).values
+    ns    = wide.count(axis=0).values
+    ax.errorbar(x, means, yerr=sems, color="black", linewidth=2.6,
+                marker="D", markersize=7, markerfacecolor="white",
+                markeredgewidth=2, capsize=5, zorder=5,
+                label="Group mean ± SEM")
+
+    for xi, n in zip(x, ns):
+        ax.annotate(f"n={int(n)}", xy=(xi, ax.get_ylim()[1]), xytext=(0, 0),
+                    textcoords="offset points", ha="center", va="bottom",
+                    fontsize=8, color="dimgray")
+
+    ax.axhline(0, color="gray", linestyle="--", linewidth=1, zorder=1)
+    ax.set_xticks(x)
+    ax.set_xticklabels([TIMEPOINT_LABELS.get(tp, tp) for tp in TIMEPOINT_ORDER], fontsize=9.5)
+    ax.set_xlim(-0.4, len(TIMEPOINT_ORDER) - 0.6)
+    ax.set_ylabel("Fear > Neutral (mean z-score)", fontsize=12)
+    ax.set_xlabel("Study visit", fontsize=12)
+    ax.set_title(f"{_HEMI_TITLES[hemi]}: Fear vs. Neutral Activity\nAcross TMS Treatment Course",
+                fontsize=13)
+    ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=6))
+    _style_axes(ax)
+    ax.legend(loc="upper right", frameon=False, fontsize=9)
+
+    fig.tight_layout()
+    fig.savefig(str(out_path), dpi=300, bbox_inches="tight")
+    fig.savefig(str(out_path).replace(".png", ".svg"), bbox_inches="tight")
+    plt.close(fig)
+    print(f"  Saved: {out_path.name} (+ .svg)")
+
+
+# ---- group statistics ---------------------------------------
+
+def _cohens_d_paired(diff: np.ndarray) -> float:
+    sd = np.nanstd(diff, ddof=1)
+    return float(np.nanmean(diff) / sd) if sd > 0 else np.nan
+
+
+def compute_dacc_stats(df_long: pd.DataFrame) -> pd.DataFrame:
+    """
+    For each ROI (L/R/bilateral), compute:
+      - group mean +/- SEM and n at each timepoint
+      - paired t-test (and Wilcoxon signed-rank as a nonparametric check)
+        for each consecutive timepoint transition (T1->T2, T2->T3, T3->T4)
+      - paired baseline-vs-end-of-course test (T1 -> T4), the primary
+        "did the treatment change fear response" comparison
+      - Cohen's d for paired differences
+    Returns one tidy DataFrame combining descriptives and contrasts.
+    """
+    rows = []
+
+    for hemi in df_long["hemi"].unique():
+        sub = df_long[df_long["hemi"] == hemi]
+        wide = sub.pivot_table(index="subject", columns="timepoint", values="mean_z")
+        wide = wide.reindex(columns=TIMEPOINT_ORDER)
+
+        # --- descriptives per timepoint ---
+        for tp in TIMEPOINT_ORDER:
+            if tp not in wide.columns:
+                continue
+            vals = wide[tp].dropna().values
+            rows.append(dict(
+                hemi=hemi, comparison=f"descriptive_{tp}",
+                timepoint_A=tp, timepoint_B=None,
+                n=len(vals),
+                mean_A=np.nanmean(vals) if len(vals) else np.nan,
+                sem_A=sstats.sem(vals, nan_policy="omit") if len(vals) else np.nan,
+                mean_B=np.nan, sem_B=np.nan, mean_diff=np.nan,
+                t_stat=np.nan, p_value=np.nan,
+                wilcoxon_stat=np.nan, wilcoxon_p=np.nan,
+                cohens_d=np.nan,
+            ))
+
+        # --- paired comparisons: consecutive + overall (T1 vs T4) ---
+        comparisons = list(zip(TIMEPOINT_ORDER[:-1], TIMEPOINT_ORDER[1:]))
+        if "T1" in wide.columns and "T4" in wide.columns:
+            comparisons.append(("T1", "T4"))
+
+        for tA, tB in comparisons:
+            if tA not in wide.columns or tB not in wide.columns:
+                continue
+            paired = wide[[tA, tB]].dropna()
+            n = len(paired)
+            label = f"{tA}_vs_{tB}"
+            if n < 2:
+                rows.append(dict(
+                    hemi=hemi, comparison=label, timepoint_A=tA, timepoint_B=tB,
+                    n=n, mean_A=paired[tA].mean() if n else np.nan,
+                    sem_A=np.nan, mean_B=paired[tB].mean() if n else np.nan,
+                    sem_B=np.nan, mean_diff=np.nan, t_stat=np.nan, p_value=np.nan,
+                    wilcoxon_stat=np.nan, wilcoxon_p=np.nan, cohens_d=np.nan,
+                ))
+                continue
+
+            diff = (paired[tB] - paired[tA]).values
+            t_stat, p_val = sstats.ttest_rel(paired[tB], paired[tA])
+            try:
+                w_stat, w_p = sstats.wilcoxon(paired[tB], paired[tA])
+            except ValueError:
+                w_stat, w_p = np.nan, np.nan
+
+            rows.append(dict(
+                hemi=hemi, comparison=label, timepoint_A=tA, timepoint_B=tB,
+                n=n,
+                mean_A=paired[tA].mean(), sem_A=sstats.sem(paired[tA]),
+                mean_B=paired[tB].mean(), sem_B=sstats.sem(paired[tB]),
+                mean_diff=np.mean(diff),
+                t_stat=t_stat, p_value=p_val,
+                wilcoxon_stat=w_stat, wilcoxon_p=w_p,
+                cohens_d=_cohens_d_paired(diff),
+            ))
+
+    stats_df = pd.DataFrame(rows)
+
+    # FDR (Benjamini-Hochberg) correction across all real paired tests
+    test_mask = stats_df["p_value"].notna()
+    if test_mask.sum() > 0:
+        pvals = stats_df.loc[test_mask, "p_value"].values
+        order = np.argsort(pvals)
+        ranked = np.empty_like(order)
+        ranked[order] = np.arange(1, len(pvals) + 1)
+        m = len(pvals)
+        fdr = pvals * m / ranked
+        # enforce monotonicity
+        fdr_sorted = np.minimum.accumulate(fdr[order][::-1])[::-1]
+        fdr_final = np.empty_like(fdr)
+        fdr_final[order] = np.clip(fdr_sorted, 0, 1)
+        stats_df.loc[test_mask, "p_fdr"] = fdr_final
+    else:
+        stats_df["p_fdr"] = np.nan
+
+    return stats_df
+
+
+def run_dacc_analysis(dacc_records: list[dict], out_dir: Path):
+    """
+    Top-level entry point: builds dACC masks, extracts per-subject/session
+    mean Fear>Neutral z-values, saves spaghetti plots and a stats CSV.
+    """
+    print("\n--- dACC longitudinal fear-response analysis (TMS treatment course) ---")
+    if not dacc_records:
+        print(f"  [WARN] No '{DACC_CONTRAST}' maps found across subjects/sessions — skipping dACC analysis.")
+        return
+
+    dacc_dir = out_dir / "dACC_analysis"
+    dacc_dir.mkdir(exist_ok=True)
+    fig_dir = dacc_dir / "figures"
+    fig_dir.mkdir(exist_ok=True)
+
+    if not os.path.exists(BN_ATLAS_PATH):
+        print(f"  [WARN] Brainnetome atlas not found at {BN_ATLAS_PATH} — skipping dACC analysis.")
+        return
+    if not os.path.exists(BN_ATLAS_LUT):
+        print(f"  [WARN] Brainnetome LUT not found at {BN_ATLAS_LUT} — skipping dACC analysis.")
+        return
+
+    target_img = image.load_img(dacc_records[0]["zmap_path"])
+    print("  Building dACC ROI masks (A24cd + A32p) from Brainnetome Atlas 246 (2mm) ...")
+    masks = build_dacc_masks(BN_ATLAS_PATH, BN_ATLAS_LUT, target_img)
+    if not masks:
+        print("  [WARN] No dACC masks could be built — skipping dACC analysis.")
+        return
+
+    print(f"  Extracting mean '{DACC_CONTRAST}' z-values for {len(dacc_records)} subject/session map(s) ...")
+    df_long = collect_dacc_values(dacc_records, masks)
+    if df_long.empty:
+        print("  [WARN] No dACC values extracted — skipping plots/stats.")
+        return
+
+    raw_csv = dacc_dir / "dACC_fear_gt_neutral_values.csv"
+    df_long.sort_values(["hemi", "subject", "timepoint"]).to_csv(raw_csv, index=False)
+    print(f"  Raw per-subject values → {raw_csv.name}")
+
+    print("  Generating spaghetti plots ...")
+    for hemi in ("L", "R", "bilateral"):
+        out_path = fig_dir / f"dACC_{hemi}_fear_gt_neutral_spaghetti.png"
+        make_dacc_spaghetti_plot(df_long, hemi, out_path)
+
+    print("  Computing group descriptives and timepoint-to-timepoint statistics ...")
+    stats_df = compute_dacc_stats(df_long)
+    stats_csv = dacc_dir / "dACC_fear_gt_neutral_stats.csv"
+    stats_df.to_csv(stats_csv, index=False)
+    print(f"  Stats summary → {stats_csv.name}")
+
+
+# ============================================================
 #  MAIN
 # ============================================================
 
@@ -395,6 +768,7 @@ def main():
 
     # First-level GLM per run, accumulate z-maps by contrast name
     all_z_maps: dict[str, list[str]] = {}
+    dacc_records: list[dict] = []  # {subject, timepoint, zmap_path} for DACC_CONTRAST
     for subj in subjects:
         runs = find_runs(DERIV_DIR, subj)
         print(f"\n{subj}: {len(runs)} task-con run(s)")
@@ -402,6 +776,12 @@ def main():
             z_maps = run_first_level(run, events, fl_dir)
             for cname, zpath in z_maps.items():
                 all_z_maps.setdefault(cname, []).append(zpath)
+            if DACC_CONTRAST in z_maps:
+                dacc_records.append(dict(
+                    subject=run["subject"],
+                    timepoint=run["session"],
+                    zmap_path=z_maps[DACC_CONTRAST],
+                ))
 
     if not all_z_maps:
         raise RuntimeError("No contrast maps were produced. Check paths and file names.")
@@ -414,6 +794,9 @@ def main():
 
     # Summary report
     write_html_report(subjects, all_z_maps, group_maps, out_dir)
+
+    # dACC longitudinal fear-response analysis (TMS treatment course)
+    run_dacc_analysis(dacc_records, out_dir)
 
     print("\n✓  Analysis complete.")
     print(f"   Outputs in: {out_dir}")
